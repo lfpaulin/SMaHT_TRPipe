@@ -1,0 +1,14 @@
+# ignore this files default
+deploy_cluster.sh
+.gitignore
+.rsync-ignore
+.git
+LICENSE
+README.md
+resultadoRsync.txt
+# other
+__pycache__
+*__pycache__*
+TRPipel
+.idea/
+.idea/*
