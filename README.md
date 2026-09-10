@@ -1,2 +1,2 @@
-# SMaHT
-Somatic Mosaicism across Human Tissues project
+# SMaHT TRPipe
+Analysis of Somatic Tandem Repeat (sTR) in SMaHT
