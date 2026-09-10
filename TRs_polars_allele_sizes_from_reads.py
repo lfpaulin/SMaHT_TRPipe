@@ -189,21 +189,55 @@ class DevTiming(object):
             return time_spent
 
 
-def clusteirng(allele_lens: np.ndarray, bandwidth: int = 20, return_uval_raw: bool = False):
+def clustering(tr_reads_df: pl.DataFrame, bandwidth: int = 20):
+    allele_lens = tr_reads_df["ReadLen"].to_numpy()
     ms = MeanShift(bandwidth=bandwidth, bin_seeding=True)
-    ms.fit(allele_lens)
+    ms.fit(allele_lens.reshape(-1, 1))
     # Extract cluster labels and center coordinates
-    uval_, ucount_ = np.unique(ms.labels_, return_counts=True)
-    uvalv_ = [ms.cluster_centers_[v][0] for v in uval_]
-    # ulabel_schema = {"Mean": pl.Float64, "Counts": pl.UInt16}
-    # ulabel = pl.DataFrame({"Mean": uval, "Counts": ucount}, schema=ulabel_schema)
-    # filters
-    has_negative_len_ = sum([v < 0 for v in uvalv_]) > 0
-    with_single_read_ = sum([c <= 2 for c in ucount_])
-    if not return_uval_raw:
-        uval_ = uvalv_
+    lab_index, lab_count = np.unique(ms.labels_, return_counts=True)
+    lab_values = np.array([ms.cluster_centers_[v][0] for v in lab_index])
+    has_negative_len_ = sum([v < 0 for v in lab_values]) > 0
+    with_single_read_ = sum([c <= 2 for c in lab_count])
 
-    return ms.cluster_centers_, ms.labels_, uval_, ucount_, has_negative_len_, with_single_read_
+    bias_status = ""
+    if len(lab_index) <= 3:
+        bias_status = "TBD"
+    else:
+        rlen_pb = tr_reads_df.filter(pl.col("Core").str.contains("B00"))["ReadLen"].to_numpy()
+        rlen_ont = tr_reads_df.filter(pl.col("Core").str.contains("D00"))["ReadLen"].to_numpy()
+        if len(rlen_pb) == 0 or len(rlen_ont) == 0:
+            bias_status = "NA_PB" if 0 == len(rlen_pb) else "NA_ONT"
+        elif len(rlen_pb) < 50 and len(rlen_ont) < 50:
+            bias_status = "LOW"
+        elif 0 < len(rlen_pb) < 50:
+            bias_status = "LOW_PB"
+        elif 0 < len(rlen_ont) < 50:
+            bias_status = "LOW_ONT"
+        else:
+            # Sometimes Mean-shift get a single value instead of array, although not used provided,
+            # We need to catch that error
+            try:
+                mspb = MeanShift(bandwidth=bandwidth, seeds=lab_values)
+                mspb.fit(rlen_pb.reshape(-1, 1))
+                n_lab_pb = len(np.unique(mspb.labels_))
+                msont = MeanShift(bandwidth=bandwidth, seeds=lab_values)
+                msont.fit(rlen_ont.reshape(-1, 1))
+                n_lab_ont = len(np.unique(msont.labels_))
+                n_lab_donor = len(lab_index)
+                if n_lab_donor == n_lab_pb == n_lab_ont:
+                    bias_status = "NONE0"  # same size => same values (?)
+                elif n_lab_donor > n_lab_pb == n_lab_ont:
+                    bias_status = "NONE1"  # same size tech => NOT same values
+                elif n_lab_donor >= n_lab_ont > n_lab_pb:
+                    bias_status = "ONT"  # bias ONT
+                elif n_lab_donor >= n_lab_pb > n_lab_ont:
+                    bias_status = "PB"  # bias PB
+                else:
+                    pass  # wtf
+            except ValueError:
+                bias_status = "MS_ERR"  # error in mean-shift that we sort of cannot control
+
+    return ms.cluster_centers_, ms.labels_, lab_index, lab_values, lab_count, has_negative_len_, with_single_read_, bias_status
 
 
 def find_candidates(tr_reads: pl.DataFrame, bandwidth = 20, check_many_clusters=7):
@@ -211,42 +245,41 @@ def find_candidates(tr_reads: pl.DataFrame, bandwidth = 20, check_many_clusters=
     candidate_stats = {}
     loci_list = tr_reads["LocusID"].unique().to_list()
     for locus in loci_list:
-        lid_alleles = tr_reads.filter(pl.col("LocusID") == locus)["ReadLen"].to_numpy()
-        lid_alleles = lid_alleles.reshape(-1, 1)
-        cluster_centers, labels, uval, ucount, has_negative_len, with_single_read = clusteirng(lid_alleles, bandwidth)
+        tr_reads_data = tr_reads.filter(pl.col("LocusID") == locus)
+        cluster_centers, labels, lab_index, lab_values, lab_count, has_negative_len, with_single_read, bias_tech_stat = clustering(tr_reads_data, bandwidth)
         num_clusters = len(np.unique(labels))
         # strict germline
         if num_clusters > 1 and not has_negative_len:
             # filter only two alleles
             if num_clusters == 2:
-                [x, y] = ucount
+                [x, y] = lab_count
                 if x/(x+y) - 0.5 < 0.05:
                     continue
             # ################################################
             # re-cluster those with high cluster number
             if num_clusters >= check_many_clusters:
-                [x, y] = [uval[i] for i in range(2)]
+                [x, y] = [lab_index[i] for i in range(2)]
                 bw = max(int(abs(x - y)/10), bandwidth)
                 log.info(f"Re-clustering candidates")
-                log.info(f'PRE: {locus} {bandwidth} v {bw}, {uval}, {ucount}, {num_clusters}')
+                log.info(f'PRE: {locus} {bandwidth} v {bw}, {lab_index}, {lab_count}, {num_clusters}')
                 if bw > bandwidth:
                     bandwidth = bw
-                    cluster_centers, lables, uval, ucount, has_negative_len, with_single_read = clusteirng(lid_alleles, bandwidth)
+                    cluster_centers, labels, lab_index, lab_values, lab_count, has_negative_len, with_single_read, bias_tech_stat = clustering(tr_reads_data, bandwidth)
                     num_clusters = len(np.unique(labels))
-                    log.info(f'AFT: {locus} {bandwidth}, {uval}, {ucount}, {num_clusters}')
+                    log.info(f'AFT: {locus} {bandwidth}, {lab_index}, {lab_count}, {num_clusters}')
                     # strict 2 clusters again
                     if num_clusters > 1 and not has_negative_len:
                         # filter only two alleles
                         if num_clusters == 2:
-                            [x, y] = ucount
+                            [x, y] = lab_count
                             if x/(x+y) - 0.5 < 0.05:
                                 continue
+                else:
+                    log.info(f'AFT: {locus} {bandwidth} => None')
             # ################################################
 
             candidate.append(locus)
-            candidate_stats[locus] = (bandwidth, cluster_centers, uval, ucount, with_single_read)
-            if (num_clusters - with_single_read) >= 5:
-                log.info(f'Candidate: {locus} with {num_clusters}.')
+            candidate_stats[locus] = (bandwidth, cluster_centers, labels, lab_index, lab_values, lab_count, with_single_read, bias_tech_stat)
     return candidate, candidate_stats
 
 
@@ -271,6 +304,8 @@ class TRFilters:
         self.unknown = []
         # read threshold < 10 reads for all mosaic/smear alleles
         self.low_support_global = []
+        # seq-tech bias
+        self.tech_bias = []
 
     def __repr__(self):
         # single len per hap, both
@@ -292,6 +327,8 @@ class TRFilters:
         unknown = len(self.unknown)
         # read threshold < 10 reads for all mosaic/smear alleles
         low_support_global = len(self.low_support_global)
+        # tech bias
+        tech_bias = len(self.tech_bias)
         return (
             f"Double-Single length-allele per haplotype: {double_single_allele}\n"
             f"Single length-allele in one haplotype, 2 in the other: {single_allele}\n"
@@ -304,6 +341,7 @@ class TRFilters:
             f"None of the above: {unknown}\n"
             f"\n"
             f"Low support global: {low_support_global}"
+            f"Likely tech bias: {tech_bias}"
         )
 
     def update(self, tr_candidate_list):
@@ -317,6 +355,7 @@ class TRFilters:
         self.smear.extend(tr_candidate_list.smear)
         self.unknown.extend(tr_candidate_list.unknown)
         self.low_support_global.extend(tr_candidate_list.low_support_global)
+        self.tech_bias.extend(tr_candidate_list.tech_bias)
 
     def filters(self, tr_class):
         filter_pass = {"single_allele_smear", "mosaic_allele", "third_allele_mosaic", "smear"}
@@ -325,6 +364,8 @@ class TRFilters:
                 return "PASS"
             elif tr_class == "unknown":
                 return "UNKNOWN"
+            elif tr_class == "tech_bias":
+                return "TECH_BIAS"
             else:
                 return "GERMLINE"
         else:
@@ -360,21 +401,36 @@ def filter_candidates(tr_candidate_reads: pl.DataFrame, min_reads_overall: int, 
     use_raw_uval = True
     loci_list = tr_candidate_reads["LocusID"].unique().to_list()
     def_bandwidth = 20
+    expected_unpack_values = 8
+    cluster_centers = "?"
     for locus in loci_list:
-        bandwidth = def_bandwidth if len(cand_stats) == 0 else cand_stats[locus][0]
+        # cand stats has in order:
+        #   bandwidth, cluster_centers, labels, lab_index, lab_values, lab_count, with_single_read, bias_tech_stat
         tr_locus = tr_candidate_reads.filter(pl.col("LocusID") == locus)
-        lid_alleles = tr_locus["ReadLen"].to_numpy()
-        if len(lid_alleles.tolist()) < min_reads_overall:
-            applied_filter.unknown.append(locus)
-            continue
-        lid_alleles = lid_alleles.reshape(-1, 1)
-        cluster_centers, labels, uval, ucount, has_negative_len, with_single_read = clusteirng(lid_alleles, bandwidth, use_raw_uval)
-        num_clusters = len(np.unique(labels))
-        if max(uval) >= len(ucount):
-            uval, ucount = fill_spaces(uval, ucount)
-        uval = np.array([cluster_centers[v][0] for v in uval])
+        if locus in cand_stats:
+            if expected_unpack_values == len(cand_stats[locus]):
+                bandwidth, cluster_centers, labels, lab_index, lab_values, lab_count, with_single_read, bias_tech_stat = cand_stats[locus]
+                if len(labels) < min_reads_overall:
+                    applied_filter.unknown.append(locus)
+                    continue
+            else:
+                assert expected_unpack_values == len(cand_stats[locus]), "err"
+        else:
+            bandwidth = def_bandwidth if len(cand_stats) == 0 else cand_stats[locus][0]
+            lid_alleles = tr_locus["ReadLen"].to_numpy()
+            if len(lid_alleles.tolist()) < min_reads_overall:
+                applied_filter.unknown.append(locus)
+                continue
+            lid_alleles = lid_alleles.reshape(-1, 1)
+            cluster_centers, labels, lab_index, lab_values, lab_count, _, with_single_read, bias_tech_stat = clustering(lid_alleles, bandwidth)
 
-        tr_locus = tr_locus.with_columns(pl.Series("Label", labels), pl.Series("Length-ish", ucount[labels]))
+        if max(lab_index) >= len(lab_count):
+            print(1, locus)
+            lab_values, lab_count = fill_spaces(lab_index, lab_count)
+
+        tr_locus = tr_locus.with_columns(pl.Series("Label", labels), pl.Series("Length-ish", lab_count[labels]))
+        if type(lab_values) is not np.ndarray:
+            lab_values = np.array(lab_values)
 
         hap_multi_allele_count = 0
         haps = []
@@ -389,21 +445,25 @@ def filter_candidates(tr_candidate_reads: pl.DataFrame, min_reads_overall: int, 
                 if hap == 0:
                     hap_multi_allele_count += 1
                 else:
-                    hp_single.append(uval[alleles_by_hap])
+                    hp_single.append(lab_values[alleles_by_hap])
                     haps.append(hap)
             else:
-                hp_multi.append(uval[alleles_by_hap])
+                hp_multi.append(lab_values[alleles_by_hap])
                 hapm.append(hap)
                 hap_multi_allele_count += 1
-        n_seen_alleles = len(uval)
+        n_seen_alleles = len(lab_values)
         add_meta = ""
         trclasstr = ""
         allele_index = 0
+        if bias_tech_stat in {"PB", "ONT"}:
+            applied_filter.tech_bias.append(locus)
+            log.info(f"LocusID = {locus}: Likely tech bias found in {lab_values} : {bias_tech_stat}")
+            continue
         if hap_multi_allele_count == 0:
             # 1 allele size per hap, and no unphased
             if save_germline:
                 applied_filter.double_single_allele.append(locus)
-                log.info(f"LocusID = {locus}: Double Single-length haplotype: {haps},{hp_single} | {n_seen_alleles}")
+                log.info(f"LocusID = {locus}: Double Single-length haplotype: {haps},{hp_single} | {n_seen_alleles} | {bias_tech_stat}")
             else:
                 applied_filter.double_single_allele.append(1)
             continue
@@ -411,7 +471,7 @@ def filter_candidates(tr_candidate_reads: pl.DataFrame, min_reads_overall: int, 
             # 1 allele size per hap, and some unphased
             if save_germline:
                 applied_filter.double_single_allele.append(locus)
-                log.info(f"LocusID = {locus}: Double Single-length haplotype: {haps},{hp_single} | {n_seen_alleles}")
+                log.info(f"LocusID = {locus}: Double Single-length haplotype: {haps},{hp_single} | {n_seen_alleles} | {bias_tech_stat}")
             else:
                 applied_filter.double_single_allele.append(1)
             continue
@@ -423,7 +483,7 @@ def filter_candidates(tr_candidate_reads: pl.DataFrame, min_reads_overall: int, 
                 add_meta = ", Mosaic" if n_seen_alleles <= 3 else ", Smear"
                 allele_index = 2  # 0 and 1 SHOULD always the germline alleles
                 applied_filter.mosaic_allele.append(locus)
-                if sum(ucount[allele_index:]) < min_reads_global_somatic or sum(ucount[allele_index:] < min_reads_global_mosaic) == len(ucount[allele_index:]):
+                if sum(lab_count[allele_index:]) < min_reads_global_somatic or sum(lab_count[allele_index:] < min_reads_global_mosaic) == len(lab_count[allele_index:]):
                     applied_filter.low_support_global.append(locus)
                     add_meta += ", LOW SUPP GLOBAL"
             elif 0 in hapm:
@@ -456,37 +516,37 @@ def filter_candidates(tr_candidate_reads: pl.DataFrame, min_reads_overall: int, 
                     else:
                         applied_filter.single_allele.append(1)
                 else:
-                    log.warn(f'"else.slh", {locus} {n_seen_alleles}, {alleles_by_hap}, {seen_haps} | {haps},{hp_single} | {hapm},{hp_multi}{add_meta}')
+                    log.warn(f'"else.slh", {locus} {n_seen_alleles}, {alleles_by_hap}, {seen_haps} | {haps},{hp_single} | {hapm},{hp_multi}{add_meta} |  | {bias_tech_stat}')
             hp_multi = [float(v) for v in hp_multi[0]] if len(hp_multi) > 0 else hp_multi
-            log.info(f"LocusID = {locus}: {trclasstr}: {haps},{hp_single} | {hapm},{hp_multi}{add_meta} | {n_seen_alleles}")
+            log.info(f"LocusID = {locus}: {trclasstr}: {haps},{hp_single} | {hapm},{hp_multi}{add_meta} | {n_seen_alleles} | {bias_tech_stat}")
             continue
         else:
             pass
         germline_allele = 0.0
         germline_proportion = 0.85
         n_alleles= 0
-        allele_counts = sum(ucount)
+        allele_counts = sum(lab_count)
         while germline_allele < germline_proportion:
-            germline_allele += ucount[allele_index] / allele_counts
+            germline_allele += lab_count[allele_index] / allele_counts
             allele_index += 1
             n_alleles += 1
         if n_alleles <= 2:
             if allele_index == 1:
-                log.info(f"LocusID = {locus}: Germline allele(s): {uval[:allele_index]}. Mosaic allele(s): {[float(v) for v in uval[allele_index:]]} VAF = {1-germline_allele} | {n_seen_alleles}")
+                log.info(f"LocusID = {locus}: Germline allele(s): {lab_values[:allele_index]}. Mosaic allele(s): {[float(v) for v in lab_values[allele_index:]]} VAF = {1-germline_allele} | {n_seen_alleles} | {bias_tech_stat}")
                 applied_filter.mosaic_allele.append(locus)
-                if sum(ucount[allele_index:]) < min_reads_global_somatic or sum(ucount[allele_index:] < min_reads_global_mosaic) == len(ucount[allele_index:]):
+                if sum(lab_count[allele_index:]) < min_reads_global_somatic or sum(lab_count[allele_index:] < min_reads_global_mosaic) == len(lab_count[allele_index:]):
                     applied_filter.low_support_global.append(locus)
                     add_meta += ", LOW SUPP GLOBAL"
             elif allele_index == 2 and germline_allele > 0.99:
                 if save_germline:
                     applied_filter.germline_allele.append(locus)
-                    log.info(f"LocusID = {locus}: Germline allele(s): {uval[:allele_index]}.")
+                    log.info(f"LocusID = {locus}: Germline allele(s): {lab_values[:allele_index]} | {bias_tech_stat}")
                 else:
                     applied_filter.germline_allele.append(1)
-            elif allele_index == 2 < len(ucount):
-                log.info(f"LocusID = {locus}: Germline allele(s): {uval[:allele_index]}. Mosaic allele(s): {[float(v) for v in uval[allele_index:]]} VAF = {1-germline_allele} | {n_seen_alleles}")
+            elif allele_index == 2 < len(lab_count):
+                log.info(f"LocusID = {locus}: Germline allele(s): {lab_values[:allele_index]}. Mosaic allele(s): {[float(v) for v in lab_values[allele_index:]]} VAF = {1-germline_allele} | {n_seen_alleles} | {bias_tech_stat}")
                 applied_filter.mosaic_allele.append(locus)
-                if sum(ucount[allele_index:]) < min_reads_global_somatic or sum(ucount[allele_index:] < min_reads_global_mosaic) == len(ucount[allele_index:]):
+                if sum(lab_count[allele_index:]) < min_reads_global_somatic or sum(lab_count[allele_index:] < min_reads_global_mosaic) == len(lab_count[allele_index:]):
                     applied_filter.low_support_global.append(locus)
                     add_meta += ", LOW SUPP GLOBAL"
             else:
@@ -495,22 +555,22 @@ def filter_candidates(tr_candidate_reads: pl.DataFrame, min_reads_overall: int, 
         else:
             if n_alleles == 3:
                 if n_seen_alleles == 3:
-                    log.info(f"LocusID = {locus}: Third allele: {uval[:allele_index]} | {n_seen_alleles}")
+                    log.info(f"LocusID = {locus}: Third allele: {lab_values[:allele_index]} | {n_seen_alleles} | {bias_tech_stat}")
                     applied_filter.third_allele.append(locus)
-                    if sum(ucount[allele_index:]) < min_reads_global_somatic or sum(ucount[allele_index:] < min_reads_global_mosaic) == len(ucount[allele_index:]):
+                    if sum(lab_count[allele_index:]) < min_reads_global_somatic or sum(lab_count[allele_index:] < min_reads_global_mosaic) == len(lab_count[allele_index:]):
                         applied_filter.low_support_global.append(locus)
                         add_meta += ", LOW SUPP GLOBAL"
                 else:
-                    log.info(f"LocusID = {locus}: Third allele: {uval[:allele_index]}, 4+ VAF = {1-germline_allele} {[float(v) for v in uval[allele_index:]]}| {n_seen_alleles}")
+                    log.info(f"LocusID = {locus}: Third allele: {lab_values[:allele_index]}, 4+ VAF = {1-germline_allele} {[float(v) for v in lab_values[allele_index:]]}| {n_seen_alleles} | {bias_tech_stat}")
                     applied_filter.third_allele_mosaic.append(locus)
-                    if sum(ucount[allele_index:]) < min_reads_global_somatic or sum(ucount[allele_index:] < min_reads_global_mosaic) == len(ucount[allele_index:]):
+                    if sum(lab_count[allele_index:]) < min_reads_global_somatic or sum(lab_count[allele_index:] < min_reads_global_mosaic) == len(lab_count[allele_index:]):
                         applied_filter.low_support_global.append(locus)
                         add_meta += ", LOW SUPP GLOBAL"
                 continue
             else:
-                log.info(f"LocusID = {locus}: Smear ?: {[float(v) for v in uval]} | {n_seen_alleles}")
+                log.info(f"LocusID = {locus}: Smear ?: {[float(v) for v in lab_values]} | {n_seen_alleles} | {bias_tech_stat}")
                 applied_filter.smear.append(locus)
-                if sum(ucount[allele_index:]) < min_reads_global_somatic or sum(ucount[allele_index:] < min_reads_global_mosaic) == len(ucount[allele_index:]):
+                if sum(lab_count[allele_index:]) < min_reads_global_somatic or sum(lab_count[allele_index:] < min_reads_global_mosaic) == len(lab_count[allele_index:]):
                     applied_filter.low_support_global.append(locus)
                     add_meta += ", LOW SUPP GLOBAL"
                 continue
@@ -521,17 +581,17 @@ def filter_candidates(tr_candidate_reads: pl.DataFrame, min_reads_overall: int, 
     return applied_filter
 
 
-def fill_spaces(uval_, ucount_):
-    uval_ = list(uval_)
-    new_uval, new_ucount = [], []
-    for c in range(0, max(uval_)+1):
-        if c in uval_:
+def fill_spaces(lab_index, lab_count_):
+    lab_values = list(lab_index)
+    new_uval, new_lab_count = [], []
+    for c in range(0, max(lab_values)+1):
+        if c in lab_values:
             new_uval.append(np.int64(c))
-            new_ucount.append(ucount_[uval_.index(c)])
+            new_lab_count.append(lab_count_[lab_values.index(c)])
         else:
             new_uval.append(np.int64(c))
-            new_ucount.append(np.int64(0))
-    return np.array(new_uval), np.array(new_ucount)
+            new_lab_count.append(np.int64(0))
+    return np.array(new_uval), np.array(new_lab_count)
 
 
 def load_data(config: TRConfig):
@@ -563,7 +623,7 @@ def summary_candidates(filtered_candidates: TRFilters, candidate_pq: str, includ
     uid = []
     labels = []
     loci = []
-    asizes = []
+    allele_sizes = []
     sample_names = []
     filters_list = []
     read_tissue_sum = {}
@@ -599,7 +659,7 @@ def summary_candidates(filtered_candidates: TRFilters, candidate_pq: str, includ
             nrow = len(l_groups)
             uid.extend([f'{lid}_{l}' for l in l_groups])
             labels.extend(l_groups)
-            asizes.extend([np.round(cluster_centers.tolist()[l][0]) for l in l_groups])
+            allele_sizes.extend([np.round(cluster_centers.tolist()[l][0]) for l in l_groups])
             loci.extend([lid] * nrow)
             filters_list.extend([cand_filter] * nrow)
             cand_list.extend([cand_type] * nrow)
@@ -626,7 +686,7 @@ def summary_candidates(filtered_candidates: TRFilters, candidate_pq: str, includ
         )
         results.insert_column(0, pl.Series("Filter", list(filters_list)))
         results.insert_column(0, pl.Series("CandidateClass", list(cand_list)))
-        results.insert_column(0, pl.Series("AlleleSize", list(asizes)))
+        results.insert_column(0, pl.Series("AlleleSize", list(allele_sizes)))
         results.insert_column(0, pl.Series("Labels", list(labels)))
         results.insert_column(0, pl.Series("LocusID", list(loci)))
         results.insert_column(0, pl.Series("UID", list(uid)))
@@ -634,8 +694,8 @@ def summary_candidates(filtered_candidates: TRFilters, candidate_pq: str, includ
     return results, read_tissue_sum
 
 
-def vcf_header(tnames: list, contig_info: list):
-    tnames_str = "\t".join(tnames)
+def vcf_header(tissue_names: list, contig_info: list):
+    tissue_names_str = "\t".join(tissue_names)
     the_header = ["##fileformat=VCFv4.2", "##source=TR_pipeline v0.1"]
     for contig, contig_len in contig_info:
         the_header.append(f'##contig=<ID={contig},length={contig_len}>')
@@ -649,7 +709,7 @@ def vcf_header(tnames: list, contig_info: list):
     the_header.append('##FILTER=<ID=UNKNOWN,Description="Failed filter assignment">')
     the_header.append('##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">')
     the_header.append('##FORMAT=<ID=AD,Number=R,Type=Integer,Description="Allele depth: ALT, REF">')
-    the_header.append(f"#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t{tnames_str}")
+    the_header.append(f"#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t{tissue_names_str}")
     return "\n".join(the_header)
 
 
@@ -874,7 +934,7 @@ def main(tr_config: TRConfig):
         # catalog locus data
         t = DevTiming(f'{each_donor}, step5: VCF output')
         t.start()
-        locus_catalog = load_adotto_bed(tr_data.adotto_v2_path)
+        locus_catalog = tr_data.load_adotto_bed()
         # Save output as VCF
         if vcf_maker(results, read_tissue_sum, locus_catalog, tr_data, each_donor, f'{results_dir}'):
             log.info("VCF writen")
@@ -883,7 +943,6 @@ def main(tr_config: TRConfig):
         t.end()
         output_done = f'{results_dir}/{each_donor}_steps.DONE'
         with open(output_done, "w") as _: pass
-
 
 
 def parse_args() -> TRConfig:
@@ -912,12 +971,12 @@ if "__main__" == __name__:
         log.info(f'Directory {config.res} does not exixist')
         try:
             os.makedirs(config.res, exist_ok=True)
-        except:
-            log.err("??")
+        except Exception as e:
+            log.err(f'{type(e).__name__}')
     if "" != config.date and not os.path.isdir(f'{config.res}/{config.date}'):
         log.info(f'Directory {config.res}/{config.date} does not exixist')
         try:
             os.makedirs(f'{config.res}/{config.date}', exist_ok=True)
-        except:
-            log.err(f"cannot make dirs: {config.res}/{config.date}")
+        except Exception as e:
+            log.err(f"cannot make dirs: {config.res}/{config.date}\n{type(e).__name__}")
     main(config)
