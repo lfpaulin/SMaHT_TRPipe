@@ -12,6 +12,7 @@ os.environ["POLARS_MAX_THREADS"] = "8"
 import polars as pl
 
 
+# For reference
 tissue_name_converter = {
     "3A": "Blood,Whole",
     "3B": "Buccal_Swab",
@@ -62,20 +63,11 @@ tissue_name_converter = {
 }
 
 
-smallify_gcc = {
-    "broad": "BR",
-    "uwsc": "UW",
-    "bcm": "BC",
-    "nysc": "NY",
-    "wu": "WU"
-}
-
-
 seq_tech = {
     "B001": "PacBio Revio HiFi WG",
+    "B004": "PacBio Revio HiFi Fiber-seq",
     "D001": "ONT PromethION 24 WG",
     "D003": "ONT PromethION 24 Ultra-Long WGS",
-    "B004": "PacBio Revio HiFi Fiber-seq"
 }
 
 
@@ -121,9 +113,10 @@ class TRConfig:
         self.tr_bed = args.tr_bed
         self.noqc = args.noqc
 
-    def setu(self, arg_tupple: tuple[str,str,str,str,str,str,str]):
+    # use as API
+    def setu(self, arg_tuple: tuple[str,str,str,str,str,str,str]):
         #donors_list, donors_meta, data_dir, res_dir, date, selected_loci, tr_bed
-        self.donors, self.donors_meta, self.data, self.res, self.date, self.loci, self.tr_bed = arg_tupple
+        self.donors, self.donors_meta, self.data, self.res, self.date, self.loci, self.tr_bed = arg_tuple
 
 
 class TRPaths:
@@ -158,24 +151,18 @@ class TRPaths:
             log.info(f'These files do not exist or these are not files: {dont_exist}')
         assert len(self.read_merge_path) - len(dont_exist) > 0, f'No files found in {self.tr_read_lens}: {self.read_merge_path}'
 
-
-padding = {
-    "trgt": 50,
-    "medaka": 250
-}
-
-
-def load_adotto_bed(bed_path: str):
-    tr_catalog = {}
-    bed_file = gzip.open(bed_path, "rt") if "gz" in bed_path else open(bed_path, "r")
-    for line in bed_file:
-        contig, pos, end, info = line.rstrip("\n").split("\t")
-        trid, motif, *_ = info.split(";")
-        _, trid = trid.split("=")
-        _, motif = motif.split("=")
-        tr_catalog[trid] = (contig, int(pos), int(end), motif)
-    bed_file.close()
-    return tr_catalog
+    def load_adotto_bed(self):
+        tr_catalog = {}
+        bed_file = gzip.open(self.adotto_v2_path, "rt") if "gz" in self.adotto_v2_path \
+            else open(self.adotto_v2_path, "r")
+        for line in bed_file:
+            contig, pos, end, info = line.rstrip("\n").split("\t")
+            trid, motif, *_ = info.split(";")
+            _, trid = trid.split("=")
+            _, motif = motif.split("=")
+            tr_catalog[trid] = (contig, int(pos), int(end), motif)
+        bed_file.close()
+        return tr_catalog
 
 
 from datetime import datetime
