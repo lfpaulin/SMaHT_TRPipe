@@ -190,9 +190,9 @@ class DevTiming(object):
 
 
 def clustering(tr_reads_df: pl.DataFrame, bandwidth: int = 20):
-    allele_lens = tr_reads_df["ReadLen"].to_numpy()
+    allele_lens = tr_reads_df["ReadLen"].to_numpy().reshape(-1, 1)
     ms = MeanShift(bandwidth=bandwidth, bin_seeding=True)
-    ms.fit(allele_lens.reshape(-1, 1))
+    ms.fit(allele_lens)
     # Extract cluster labels and center coordinates
     lab_index, lab_count = np.unique(ms.labels_, return_counts=True)
     lab_values = np.array([ms.cluster_centers_[v][0] for v in lab_index])
@@ -203,8 +203,8 @@ def clustering(tr_reads_df: pl.DataFrame, bandwidth: int = 20):
     if len(lab_index) <= 3:
         bias_status = "TBD"
     else:
-        rlen_pb = tr_reads_df.filter(pl.col("Core").str.contains("B00"))["ReadLen"].to_numpy()
-        rlen_ont = tr_reads_df.filter(pl.col("Core").str.contains("D00"))["ReadLen"].to_numpy()
+        rlen_pb = tr_reads_df.filter(pl.col("Core").str.contains("B00"))["ReadLen"].to_numpy().reshape(-1, 1)
+        rlen_ont = tr_reads_df.filter(pl.col("Core").str.contains("D00"))["ReadLen"].to_numpy().reshape(-1, 1)
         if len(rlen_pb) == 0 or len(rlen_ont) == 0:
             bias_status = "NA_PB" if 0 == len(rlen_pb) else "NA_ONT"
         elif len(rlen_pb) < 50 and len(rlen_ont) < 50:
@@ -216,26 +216,34 @@ def clustering(tr_reads_df: pl.DataFrame, bandwidth: int = 20):
         else:
             # Sometimes Mean-shift get a single value instead of array, although not used provided,
             # We need to catch that error
+            bias_statusl = []
             try:
-                mspb = MeanShift(bandwidth=bandwidth, seeds=lab_values)
-                mspb.fit(rlen_pb.reshape(-1, 1))
+                mspb = MeanShift(bandwidth=bandwidth, seeds=lab_values.reshape(-1, 1))
+                mspb.fit(rlen_pb)
                 n_lab_pb = len(np.unique(mspb.labels_))
-                msont = MeanShift(bandwidth=bandwidth, seeds=lab_values)
-                msont.fit(rlen_ont.reshape(-1, 1))
+            except ValueError as epb:
+                bias_statusl.append("MS_ERR_PB")
+            try:
+                msont = MeanShift(bandwidth=bandwidth, seeds=lab_values.reshape(-1, 1))
+                msont.fit(rlen_ont)
                 n_lab_ont = len(np.unique(msont.labels_))
+            except ValueError as eont:
+                bias_statusl.append("MS_ERR_ONT")
+            
+            if len(bias_statusl) == 0:
                 n_lab_donor = len(lab_index)
                 if n_lab_donor == n_lab_pb == n_lab_ont:
                     bias_status = "NONE0"  # same size => same values (?)
                 elif n_lab_donor > n_lab_pb == n_lab_ont:
-                    bias_status = "NONE1"  # same size tech => NOT same values
+                    bias_status = "NONE1"  # same size tech => NOT same values i.e  A,B,C,D     A,B,C     A,B,D
                 elif n_lab_donor >= n_lab_ont > n_lab_pb:
-                    bias_status = "ONT"  # bias ONT
+                    bias_status = "ONT"  # bias ONT  A,B,C,D,E     A,C,D,E     A,B
                 elif n_lab_donor >= n_lab_pb > n_lab_ont:
                     bias_status = "PB"  # bias PB
                 else:
                     pass  # wtf
-            except ValueError:
-                bias_status = "MS_ERR"  # error in mean-shift that we sort of cannot control
+            else:
+                bias_status = ",".join(bias_statusl)  # error in mean-shift that we sort of cannot control
 
     return ms.cluster_centers_, ms.labels_, lab_index, lab_values, lab_count, has_negative_len_, with_single_read_, bias_status
 
@@ -248,7 +256,7 @@ def find_candidates(tr_reads: pl.DataFrame, bandwidth = 20, check_many_clusters=
         tr_reads_data = tr_reads.filter(pl.col("LocusID") == locus)
         cluster_centers, labels, lab_index, lab_values, lab_count, has_negative_len, with_single_read, bias_tech_stat = clustering(tr_reads_data, bandwidth)
         num_clusters = len(np.unique(labels))
-        # strict germline
+        # strict germline (implicit 1 cluster removal)
         if num_clusters > 1 and not has_negative_len:
             # filter only two alleles
             if num_clusters == 2:
@@ -258,7 +266,7 @@ def find_candidates(tr_reads: pl.DataFrame, bandwidth = 20, check_many_clusters=
             # ################################################
             # re-cluster those with high cluster number
             if num_clusters >= check_many_clusters:
-                [x, y] = [lab_index[i] for i in range(2)]
+                x, y =  min(lab_values), max(lab_values)  # TODO rever or update, the idea was between two 'major' clusters, assumes they exist
                 bw = max(int(abs(x - y)/10), bandwidth)
                 log.info(f"Re-clustering candidates")
                 log.info(f'PRE: {locus} {bandwidth} v {bw}, {lab_index}, {lab_count}, {num_clusters}')
@@ -339,8 +347,7 @@ class TRFilters:
             f"Three alleles represent 85% + mosaic: {third_allele_mosaic}\n"
             f"+4 alleles represent 85%: {smear}\n"
             f"None of the above: {unknown}\n"
-            f"\n"
-            f"Low support global: {low_support_global}"
+            f"Low support global: {low_support_global}\n"
             f"Likely tech bias: {tech_bias}"
         )
 
@@ -425,7 +432,6 @@ def filter_candidates(tr_candidate_reads: pl.DataFrame, min_reads_overall: int, 
             cluster_centers, labels, lab_index, lab_values, lab_count, _, with_single_read, bias_tech_stat = clustering(lid_alleles, bandwidth)
 
         if max(lab_index) >= len(lab_count):
-            print(1, locus)
             lab_values, lab_count = fill_spaces(lab_index, lab_count)
 
         tr_locus = tr_locus.with_columns(pl.Series("Label", labels), pl.Series("Length-ish", lab_count[labels]))
@@ -951,7 +957,7 @@ def parse_args() -> TRConfig:
     parser.add_argument("--donors-meta", required=True, type=str)          # donor metadata (donors.json)
     parser.add_argument("--data-dir", required=True, type=str)             # base directory
     parser.add_argument("--res-dir", required=True, type=str)              # results directory
-    parser.add_argument("--tr-bed", required=True, type=str)               # bed file withthe TR catalog
+    parser.add_argument("--tr-bed", required=True, type=str)               # bed file with the TR catalog
     # extra
     parser.add_argument("--date", required=False, type=str, default="")                  # date for results directory
     parser.add_argument("--selected-loci", required=False, type=str, default="")  # use only these loci
@@ -963,18 +969,18 @@ def parse_args() -> TRConfig:
 
 if "__main__" == __name__:
     config = parse_args()
-    assert os.path.isfile(config.donors), f'File {config.donors} does not exixist'
-    assert os.path.isfile(config.tr_bed), f'File {config.tr_bed} does not exixist'
-    assert os.path.isfile(config.donors_meta), f'File {config.donors_meta} does not exixist'
-    assert os.path.isdir(config.data), f'Directory {config.data} does not exixist'
+    assert os.path.isfile(config.donors), f'File {config.donors} does not exist'
+    assert os.path.isfile(config.tr_bed), f'File {config.tr_bed} does not exist'
+    assert os.path.isfile(config.donors_meta), f'File {config.donors_meta} does not exist'
+    assert os.path.isdir(config.data), f'Directory {config.data} does not exist'
     if not os.path.isdir(config.res):
-        log.info(f'Directory {config.res} does not exixist')
+        log.info(f'Directory {config.res} does not exist')
         try:
             os.makedirs(config.res, exist_ok=True)
         except Exception as e:
             log.err(f'{type(e).__name__}')
     if "" != config.date and not os.path.isdir(f'{config.res}/{config.date}'):
-        log.info(f'Directory {config.res}/{config.date} does not exixist')
+        log.info(f'Directory {config.res}/{config.date} does not exist')
         try:
             os.makedirs(f'{config.res}/{config.date}', exist_ok=True)
         except Exception as e:
